@@ -32,6 +32,89 @@ from astrbot_plugin_codex_bridge.relay import AstrBotRelay, make_event
 
 
 class TogetherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_actual_agent_loop_stops_silent_notice_without_sending_tool_status(self):
+        from astrbot.core.agent.hooks import BaseAgentRunHooks
+        from astrbot.core.agent.run_context import ContextWrapper
+        from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+        from astrbot.core.astr_agent_run_util import run_agent
+        from astrbot.api.provider import LLMResponse
+
+        event = make_event(self.context, self.origin, event_payload("silent-loop", {"kind": "task_progress"}))
+        tool = FunctionTool(name="mood_ignore_codex_notice", description="先放下", parameters={"type": "object", "properties": {}})
+        plugin = self.mood
+
+        class Executor:
+            async def execute(self, tool, run_context, **kwargs):
+                from mcp.types import CallToolResult, TextContent
+                result = await plugin.ignore_codex_notice(run_context.context.event, "这会儿不想听")
+                yield CallToolResult(content=[TextContent(type="text", text=result)])
+
+        provider = SimpleNamespace(provider_config={"id": "notice-test", "max_context_tokens": 0},
+            text_chat=AsyncMock(return_value=LLMResponse(role="assistant", completion_text="",
+                tools_call_name=[tool.name], tools_call_args=[{}], tools_call_ids=["silence-call"])))
+        runner = ToolLoopAgentRunner()
+        await runner.reset(provider=provider, request=ProviderRequest(prompt=event.get_message_str(), func_tool=ToolSet([tool])),
+            run_context=ContextWrapper(context=SimpleNamespace(event=event)), tool_executor=Executor(),
+            agent_hooks=BaseAgentRunHooks(), streaming=False)
+        async with asyncio.timeout(5):
+            async for chain in run_agent(runner, show_tool_use=True, show_tool_call_result=False):
+                if chain:
+                    await event.send(chain)
+        self.assertTrue(runner.was_aborted())
+        provider.text_chat.assert_awaited_once()
+        self.context.send_message.assert_not_awaited()
+        self.assertEqual(event.get_extra("w1_notice_disposition")["action"], "ignore")
+
+    async def test_ignored_codex_notice_does_not_erase_results_or_count_as_outbound_chat(self):
+        self.bridge.store.add("检查代码", "", None, 0, self.origin)
+        event = make_event(self.context, self.origin, event_payload("ignored-one", {
+            "kind": "task_result", "state": "completed", "result": "测试通过",
+        }))
+        before_sent = self.leisure.state.last_outbound
+        before_time = self.leisure.state.targets[self.origin].last_sent
+        before_gap = self.bridge.link.state["last_sent"]
+        request = ProviderRequest(prompt=event.get_message_str())
+        await self.play.normal_request(event, request)
+        await self.leisure.observe_request(event, request)
+        await self.mood.apply_mood(event, request)
+        self.assertEqual(self.leisure.state.last_outbound, before_sent)
+        outcome = await self.mood.ignore_codex_notice(event, "这会儿有点累，不想接这个")
+        self.assertIn("已先放下", outcome)
+        self.assertTrue(event.get_extra("agent_stop_requested"))
+        self.assertEqual(event.get_extra("w1_notice_disposition")["action"], "ignore")
+        response = SimpleNamespace(completion_text="")
+        await self.play.agent_done(event, None, response)
+        await self.leisure.observe_response(event, response)
+        await self.mood.finish_agent(event, None, response)
+        await self.bridge.companion_done(event, None, response)
+        self.assertEqual(self.leisure.state.last_outbound, before_sent)
+        self.assertEqual(self.leisure.state.targets[self.origin].last_sent, before_time)
+        self.assertEqual(self.bridge.link.state["last_sent"], before_gap)
+        self.assertFalse(self.leisure.reflection_jobs)
+        self.assertTrue(self.bridge.store.recent())
+        self.assertFalse(self.sent)
+        await self.drain()
+
+    async def test_ignore_notice_tool_is_unavailable_for_real_user_chat_and_obeys_configuration(self):
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+        tool = FunctionTool(name="mood_ignore_codex_notice", description="先放下播报", parameters={"type": "object", "properties": {}})
+        self.context.get_llm_tool_manager = lambda: SimpleNamespace(get_func=lambda _: tool)
+        real = self.event("陪我聊会儿")
+        request = ProviderRequest(prompt=real.get_message_str(), func_tool=ToolSet([tool]))
+        await self.mood.scope_notice_tools(real, request)
+        self.assertIsNone(request.func_tool.get_tool(tool.name))
+        await self.mood.ignore_codex_notice(real)
+        self.assertIsNone(real.get_extra("agent_stop_requested"))
+        background = self.event("任务完成", task=True)
+        await self.mood.scope_notice_tools(background, request)
+        self.assertIsNotNone(request.func_tool.get_tool(tool.name))
+        self.mood.config["allow_codex_notice_refusal"] = False
+        await self.mood.scope_notice_tools(background, request)
+        self.assertIsNone(request.func_tool.get_tool(tool.name))
+        await self.mood.ignore_codex_notice(background)
+        self.assertIsNone(background.get_extra("agent_stop_requested"))
+
     async def test_real_codex_event_has_source_in_transport_prompt_and_all_observers(self):
         self.context.get_llm_tool_manager = lambda: SimpleNamespace(get_func=lambda _: None)
         self.bridge.relay = AstrBotRelay(self.context)
@@ -49,6 +132,9 @@ class TogetherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("没有新的用户发言", request.system_prompt)
         self.assertTrue(event.message_obj.message_id.startswith("proactive:codex_bridge:"))
         self.assertFalse(event.get_extra("w1_event")["is_user_message"])
+        self.assertEqual(event.get_extra("w1_event")["recipient"], "astrbot")
+        self.assertFalse(event.get_extra("w1_event")["user_has_seen_report"])
+        self.assertIn("用户还没有看到原文", request.system_prompt)
         self.assertFalse(self.play.match(event))
         self.assertFalse(self.mood.clocks.sessions)
         self.assertFalse(self.leisure.reflection_jobs)
