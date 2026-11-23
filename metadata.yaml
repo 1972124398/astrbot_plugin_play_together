@@ -1,7 +1,7 @@
 name: astrbot_plugin_play_together
 display_name: 陪它玩
 desc: AI 闲下来想找人玩一小局，支持猜数字、石头剪刀布和故事接龙，带着人格与情绪自然互动。
-version: 0.1.0
+version: 0.1.1
 author: W1
 repo: https://github.com/1972124398/astrbot_plugin_play_together
 astrbot_version: ">=4.29.4,<5"

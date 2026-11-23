@@ -149,6 +149,18 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.state.rooms[self.origin].player_id, "person")
         self.assertEqual(self.plugin.state.rooms[self.origin].phase, "playing")
 
+    async def test_asking_how_to_play_keeps_the_invitation_and_can_pick_another_game(self):
+        await self.plugin.auto_invite()
+        event = self.event("怎么玩呀")
+        await self.plugin.normal_request(event, ProviderRequest(prompt="怎么玩呀"))
+        self.assertEqual(self.plugin.state.rooms[self.origin].phase, "invite")
+        await self.plugin.normal_response(event, SimpleNamespace())
+        choice = self.event("故事接龙")
+        self.assertTrue(self.plugin.match(choice))
+        await self.plugin.game_input(choice)
+        await self.drain()
+        self.assertEqual(self.plugin.state.rooms[self.origin].game, "story")
+
     async def test_unanswered_invitation_is_not_resent_after_expiry(self):
         await self.plugin.auto_invite()
         room = self.plugin.state.rooms[self.origin]

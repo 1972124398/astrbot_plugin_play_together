@@ -153,7 +153,7 @@ class PlayTogether(Star):
         room = self.room_for(event)
         if room and room.expires > time.time():
             if room.phase == "invite":
-                return key in ACCEPT | STOP
+                return key in ACCEPT | STOP | START or game_key(text) in self.games()
             if room.player_id != event.get_sender_id():
                 return False
             return key in STOP | HINT or (room.phase == "playing" and GAMES[room.game].accepts(text))
@@ -213,6 +213,7 @@ class PlayTogether(Star):
                 self.state.targets.setdefault(room.origin, Target()).ignored = True
             self.stop_room(room)
         elif room.phase == "invite":
+            room.game = game_key(text) or room.game
             room.player_id, room.player_name = event.get_sender_id(), event.get_sender_name()
             room.phase = "playing"
             room.data = GAMES[room.game].start(self.options(), random)
@@ -433,7 +434,10 @@ class PlayTogether(Star):
         origin = self.target_for(event)[0]
         room = self.room_for(event)
         if room and room.phase == "invite":
-            self.state.rooms.pop(room.scope, None)
+            if any(word in event.get_message_str() for word in ("怎么玩", "什么游戏", "啥游戏", "哪个游戏", "玩法", "规则", "猜数字", "猜拳", "故事", "接龙")):
+                request.extra_user_content_parts.append(TextPart(text=f"你刚刚邀请当前会话玩{GAMES[room.game].name}，还在等对方接住。可以自然解释玩法，确认时让对方说“来一局”或用 /play 指定游戏，实际开局由陪它玩插件处理。").mark_as_temp())
+            else:
+                self.state.rooms.pop(room.scope, None)
         self.state.touch(time.time(), self.delay(), origin if origin in self.state.targets or origin in self.targets() else "")
         target = self.state.targets.get(origin)
         if target and target.last_result:
@@ -456,10 +460,14 @@ class PlayTogether(Star):
             yield event.plain_result("陪它玩现在歇着呢，启用后再来玩。")
             return
         room = self.room_for(event)
+        invited = room.game if room and room.phase == "invite" else ""
+        if invited:
+            self.state.rooms.pop(room.scope, None)
+            room = None
         if room and room.expires > time.time():
             yield event.plain_result("这边还有一局。用 /play_status 看看，或用 /play_stop 先收起来。")
             return
-        key = game_key(game) if game else choose_game(self.games(), self.target_for(event)[1].last_game)
+        key = game_key(game) if game else (invited if invited in self.games() else choose_game(self.games(), self.target_for(event)[1].last_game))
         if key not in self.games():
             yield event.plain_result("可以玩：" + "、".join(GAMES[key].name for key in self.games()) + "。例如 /play 猜数字。" if self.games() else "先在配置页勾选想玩的小游戏，再来找我。")
             return
