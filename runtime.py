@@ -11,6 +11,8 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.core.platform.astrbot_message import Group
 from astrbot.core.platform.message_session import MessageSession
 
+from .interop import CompanionLink
+
 
 class GameEvent(AstrMessageEvent):
     def __init__(self, session, platform, player="", label=""):
@@ -33,6 +35,7 @@ class GameEvent(AstrMessageEvent):
 class Runtime:
     def __init__(self, context, config):
         self.context, self.config = context, config
+        self.link = CompanionLink(context, "play_together", config)
 
     def platform(self, origin):
         session = MessageSession.from_str(origin)
@@ -68,34 +71,17 @@ class Runtime:
         return None
 
     def social(self, origin):
-        companion = self.star("astrbot_plugin_self_amusement")
-        if companion:
-            target = companion.state.targets.get(origin)
-            if target:
-                return target.impression(), target.attraction(), bool(target.wants_space or target.unanswered >= 2)
-        return {}, 1.0, False
+        state = self.link.snapshot("self_amusement", origin)
+        return state.get("impression", {}), state.get("attraction", 1.0), state.get("wants_space", False)
 
     def companion_busy(self):
-        companion = self.star("astrbot_plugin_self_amusement")
-        if not companion:
-            return False
-        tasks = [getattr(companion, name, None) for name in ("activity_task", "preview_worker")]
-        return any(task and not task.done() for task in tasks) or bool(getattr(companion, "active_turns", {}))
+        return not self.link.idle_ready()
 
     def companion_touch(self, origin, now, hold_until=0):
-        companion = self.star("astrbot_plugin_self_amusement")
-        if companion:
-            companion.state.engage(origin, now, companion.idle_delay(), human=True)
-            companion.state.next_wake = max(companion.state.next_wake, hold_until)
-            companion.changed()
-            companion.wake.set()
+        self.link.human(origin)
 
     def mood(self):
-        mood = self.star("astrbot_plugin_short_term_mood")
-        if mood and mood.config.get("enabled", True):
-            state = mood.read_state()
-            return {"levels": dict(state.levels), "feeling": state.inner_state}
-        return {}
+        return self.link.snapshot("short_term_mood")
 
     async def view(self, origin, player="", label=""):
         session, platform = self.platform(origin)
@@ -119,9 +105,11 @@ class Runtime:
 
     async def generate(self, view, system, data):
         data = {**data, "play_preferences": str(self.config.get("play_preferences", "") or "")[:2000]}
+        data["companion"] = self.link.context_for(view.origin)
         request = ProviderRequest(system_prompt=view.persona + "\n\n" + system, prompt=json.dumps(data, ensure_ascii=False))
-        mood = self.star("astrbot_plugin_short_term_mood")
+        mood = self.link.peer("short_term_mood", view.origin)
         if mood:
+            view.event.set_extra("astrbot_short_term_mood.hint", None)
             await mood.apply_mood(view.event, request)
         response = await self.context.llm_generate(
             chat_provider_id=view.provider_id, prompt=request.prompt, system_prompt=request.system_prompt,

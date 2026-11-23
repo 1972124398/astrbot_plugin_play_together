@@ -17,6 +17,7 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.tool import ToolSet
 
 from .games import GAMES, Turn, choose_game, game_key
+from .interop import CompanionLink, conversation_key, event_kind
 from .prompts import INVITE_SYSTEM, MODEL_PLAY_HINT, STORY_OPEN_SYSTEM, STORY_SYSTEM, VOICE_SYSTEM, parse_invite
 from .routing import ACCEPT, AGAIN, CONCEDE, HINT, PAUSE, RESUME, SWITCH, PlayInputFilter, START, STOP, phrase
 from .runtime import Runtime
@@ -27,6 +28,7 @@ class PlayTogether(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self.link = CompanionLink(context, "play_together", config)
         self.runtime = Runtime(context, config)
         self.store = Store(StarTools.get_data_dir("astrbot_plugin_play_together"))
         try:
@@ -109,13 +111,43 @@ class PlayTogether(Star):
                 except Exception as error:
                     logger.warning("Play Together could not save its state (%s)", type(error).__name__)
 
-    def touch(self, origin, human=True):
+    def touch(self, origin, human=True, broadcast=True):
         now = time.time()
         self.state.touch(now, self.delay(), origin, human)
-        hold = max((room.expires for room in self.state.rooms.values() if room.phase == "playing"), default=0)
-        self.runtime.companion_touch(origin, now, hold)
+        if human and broadcast:
+            self.runtime.companion_touch(origin, now)
         self.changed()
         self.wake.set()
+
+    def companion_snapshot(self, origin=""):
+        rooms = [room for room in self.state.rooms.values() if room.expires > time.time()]
+        if not origin:
+            return {"holding_attention": any(room.phase in {"invite", "playing", "ending"} for room in rooms)}
+        room = next((room for room in rooms if conversation_key(room.origin) == conversation_key(origin)), None)
+        target = next((target for umo, target in self.state.targets.items() if conversation_key(umo) == conversation_key(origin)), None)
+        return {"games": {key: GAMES[key].name for key in self.games()},
+                "current_game": self.public_game(room) if room else None,
+                "last_game": target.last_result if target else "",
+                "can_invite": self.config.get("auto_invite", True) and origin in self.targets() and not rooms}
+
+    def companion_observe(self, packet):
+        if packet["kind"] == "human_activity":
+            origin = packet["origin"]
+            self.state.touch(time.time(), self.delay(), origin if origin in self.targets() else "")
+            self.changed()
+            self.wake.set()
+
+    async def invite_from_companion(self, origin, idea, idle_token):
+        if not self.link.enabled or not self.link.idle_current(idle_token):
+            return False
+        return await self._auto_invite(idle_token, origin, idea)
+
+    def share_turn(self, room, job, text, outcome="", persona=""):
+        self.link.publish("game_turn", room.origin, {
+            "game": GAMES[room.game].name, "action": job["kind"], "outcome": outcome,
+            "human_text": job.get("text", ""), "reply": text, "persona": persona,
+            "handled_by_chat": job.get("result") is not None,
+        }, event_id=f"play:{room.uid}:{room.revision}")
 
     def busy(self):
         now = time.monotonic()
@@ -204,7 +236,7 @@ class PlayTogether(Star):
                     time.time() + self.setting("game_idle_minutes", 15, 2, 120) * 60,
                     player_id=event.get_sender_id(), player_name=event.get_sender_name(), data=GAMES[key].start(self.options(), random))
         self.state.rooms[scope] = room
-        self.touch(room.origin)
+        self.touch(room.origin, broadcast=result is None)
         self.enqueue(scope, "start", result=result, story_line=story_line)
 
     def stop_room(self, room):
@@ -366,14 +398,23 @@ class PlayTogether(Star):
         try:
             if job.get("result") is None:
                 async with asyncio.timeout(self.setting("send_timeout_seconds", 30, 3, 120)):
-                    await self.runtime.send(room.origin, text)
+                    delivered = await self.runtime.send(room.origin, text)
+                if delivered:
+                    view = self.views.get(scope)
+                    if view is None:
+                        try:
+                            view = await self.runtime.view(room.origin, room.player_id, room.player_name)
+                            self.views[scope] = view
+                        except Exception:
+                            pass
+                    self.share_turn(room, job, text, turn.outcome, getattr(view, "persona", ""))
         finally:
             self.sending.discard(scope)
             if turn.finished and self.state.rooms.get(scope) is room:
                 self.state.finish(room, turn.facts, time.time())
                 self.state.rooms.pop(scope)
                 self.views.pop(scope, None)
-                self.touch(room.origin, human=bool(room.player_id))
+                self.touch(room.origin, human=False)
                 await self.persist()
         return text
 
@@ -397,9 +438,18 @@ class PlayTogether(Star):
         self.queues.pop(scope, None)
 
     async def auto_invite(self):
+        token = self.link.claim_idle()
+        if token is None:
+            return
+        try:
+            return await self._auto_invite(token)
+        finally:
+            self.link.release_idle(token)
+
+    async def _auto_invite(self, idle_token, preferred_origin="", idea=""):
         now = time.time()
         if (self.closing or not self.config.get("enabled", True) or not self.config.get("auto_invite", True)
-                or now < self.state.next_invite or self.state.rooms or self.busy() or self.runtime.companion_busy()):
+                or (not preferred_origin and now < self.state.next_invite) or self.state.rooms or self.busy()):
             return
         current = datetime.fromtimestamp(now)
         first, last = int(self.setting("active_start_hour", 9, 0, 23)), int(self.setting("active_end_hour", 23, 0, 24))
@@ -410,6 +460,8 @@ class PlayTogether(Star):
             return
         candidates, weights = [], []
         for origin in self.targets():
+            if preferred_origin and origin != preferred_origin:
+                continue
             target = self.state.targets.get(origin, Target())
             if target.ignored or now - target.last_invited < self.setting("target_gap_minutes", 240, 10, 10080) * 60:
                 continue
@@ -441,10 +493,11 @@ class PlayTogether(Star):
                 async with asyncio.timeout(self.setting("voice_timeout_seconds", 8, 1, 60)):
                     view = await self.runtime.view(origin)
                     text = await self.runtime.generate(view, INVITE_SYSTEM, {
-                        "games": {key: GAMES[key].name for key in self.games()}, "mood": self.runtime.mood(),
+                        "games": {key: GAMES[key].name for key in self.games()}, "mood": self.link.snapshot("short_term_mood", origin),
                         "company": self.runtime.social(origin)[0],
                         "recent_games": self.state.targets.get(origin, Target()).recent,
                         "preferences": str(self.config.get("play_preferences", "") or ""),
+                        "idea": idea,
                     })
                 key, line = parse_invite(text, self.games())
                 if key == "wait":
@@ -452,7 +505,8 @@ class PlayTogether(Star):
                     return
             except Exception as error:
                 logger.info("Play Together used a local invitation (%s)", type(error).__name__)
-        if self.closing or revision != self.state.revision or self.state.rooms or origin not in self.targets() or self.busy():
+        if (self.closing or revision != self.state.revision or self.state.rooms or origin not in self.targets()
+                or self.busy() or not self.link.idle_current(idle_token)):
             return
         scope = self.runtime.scope(origin)
         room = Room(scope, origin, key, "invite", time.time(), time.time() + self.setting("invitation_minutes", 5, 1, 30) * 60)
@@ -460,7 +514,7 @@ class PlayTogether(Star):
         self.state.rooms[scope] = room
         self.state.reserve_invite(origin, time.time())
         await self.persist()
-        if revision != self.state.revision:
+        if revision != self.state.revision or not self.link.idle_current(idle_token):
             if self.state.rooms.get(scope) is room and room.phase == "invite":
                 self.state.rooms.pop(scope)
             self.changed()
@@ -468,10 +522,13 @@ class PlayTogether(Star):
         self.auto_sending = True
         try:
             async with asyncio.timeout(self.setting("send_timeout_seconds", 30, 3, 120)):
-                await self.runtime.send(origin, room.last_public)
+                delivered = await self.runtime.send(origin, room.last_public)
         finally:
             self.auto_sending = False
         self.activity = "递了个邀约，等对方想不想玩"
+        if delivered:
+            self.link.sent(origin, room.last_public)
+        return bool(delivered)
 
     async def run(self):
         while True:
@@ -567,7 +624,7 @@ class PlayTogether(Star):
                 room.paused_public = room.paused_public or room.last_public
             if action == "stop" and room.phase == "invite":
                 self.state.targets.setdefault(room.origin, Target()).ignored = True
-            self.touch(room.origin)
+            self.touch(room.origin, broadcast=False)
             scope = room.scope
             played_room = room
             self.enqueue(scope, kinds[action], value or event.get_message_str(), event.get_sender_id(), event.get_sender_name(),
@@ -579,6 +636,7 @@ class PlayTogether(Star):
                 "scope": scope, "uid": played_room.uid, "origin": played_room.origin,
                 "revision": current.revision if current and current.uid == played_room.uid else None,
                 "story_line": played_room.game == "story" and action in {"move", "start", "switch"},
+                "game": GAMES[played_room.game].name, "action": action, "facts": result,
             })
             return "游戏进度已更新，公开结果如下。请用自己的口吻直接接话，插件不会另发重复回复。\n" + result
         except TimeoutError:
@@ -588,7 +646,14 @@ class PlayTogether(Star):
     async def normal_request(self, event: AstrMessageEvent, request):
         if event.get_extra("play_together") or self.closing or not self.config.get("enabled", True):
             return
-        self.model_tools(event, request)
+        self.link.begin(event)
+        if event.get_extra("play_together_persona") is None:
+            event.set_extra("play_together_persona", request.system_prompt or "")
+        self.link.inject(event, request)
+        if event_kind(event) == "dialogue":
+            self.model_tools(event, request)
+        elif request.func_tool:
+            request.func_tool.remove_tool("play_together_turn")
         token = event.get_extra("play_together_turn")
         if token is None:
             self.serial += 1
@@ -600,7 +665,8 @@ class PlayTogether(Star):
         for task in self.voices.values():
             task.cancel()
         origin = self.target_for(event)[0]
-        self.state.touch(time.time(), self.delay(), origin if origin in self.state.targets or origin in self.targets() else "")
+        self.state.touch(time.time(), self.delay(), origin if origin in self.state.targets or origin in self.targets() else "",
+                         human=event_kind(event) == "dialogue")
         target = self.state.targets.get(origin)
         if target and target.last_result:
             request.extra_user_content_parts.append(TextPart(text="你和当前会话最近玩过的小游戏，供自然接话：\n" + target.last_result).mark_as_temp())
@@ -608,9 +674,17 @@ class PlayTogether(Star):
 
     @filter.on_llm_response(priority=-120)
     async def normal_response(self, event: AstrMessageEvent, response):
+        self.link.end(event, response)
+        if getattr(response, "tools_call_args", None):
+            return
         reply = event.get_extra("play_together_model_reply")
         text = getattr(response, "completion_text", "") or ""
         if reply and text:
+            self.link.publish("game_turn", reply["origin"], {
+                "game": reply["game"], "action": reply["action"], "outcome": reply["facts"],
+                "human_text": "", "reply": text, "handled_by_chat": True,
+                "persona": event.get_extra("play_together_persona") or "", "already_appraised_input": True,
+            }, event_id=f"play-model:{reply['uid']}:{reply['revision']}:{reply['action']}")
             room = self.state.rooms.get(reply["scope"])
             if room and room.uid == reply["uid"] and room.revision == reply["revision"]:
                 room.last_public = text
@@ -628,6 +702,7 @@ class PlayTogether(Star):
 
     @filter.on_agent_done(priority=-120)
     async def agent_done(self, event: AstrMessageEvent, run_context, response):
+        self.link.end(event)
         self.normal_turns.pop(event.get_extra("play_together_turn"), None)
         self.wake.set()
 
@@ -727,6 +802,7 @@ class PlayTogether(Star):
         if self.closing:
             return
         self.closing = True
+        self.link.close()
         tasks = [task for task in [self.scheduler, self.saver, self.auto_task, *self.workers.values(), *self.voices.values()] if task]
         for task in tasks:
             task.cancel()

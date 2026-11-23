@@ -3,7 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 SDK_AVAILABLE = importlib.util.find_spec("astrbot") is not None
@@ -30,6 +30,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_persona_and_preferences_reach_the_model_without_game_secrets(self):
         view = await self.runtime.view("test:FriendMessage:person", "person")
         text = await self.runtime.generate(view, "只说一句玩笑", {"game": "猜数字", "moment": "opening"})
+        self.assertTrue(text)
         arguments = self.context.llm_generate.call_args.kwargs
         self.assertIn("爱接梗", arguments["system_prompt"])
         self.assertIn("奇怪的猫", arguments["prompt"])
@@ -45,9 +46,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.runtime.send("test:FriendMessage:person", "来玩一局？"))
         self.context.send_message.assert_awaited_once()
 
-    async def test_companion_idle_time_is_held_until_the_active_game_can_rest(self):
-        companion = SimpleNamespace(state=SimpleNamespace(engage=lambda *args, **kwargs: None, next_wake=50),
-                                    idle_delay=lambda: 100, changed=lambda: None, wake=SimpleNamespace(set=lambda: None))
-        self.context.get_registered_star = lambda _: SimpleNamespace(activated=True, star_cls=companion)
+    async def test_game_activity_uses_the_companions_public_feedback_endpoint(self):
+        companion = SimpleNamespace(config={}, companion_observe=Mock())
+        self.context.get_registered_star = lambda name: SimpleNamespace(activated=True, star_cls=companion) if name == "astrbot_plugin_self_amusement" else None
         self.runtime.companion_touch("test:FriendMessage:person", 1000, 2000)
-        self.assertEqual(companion.state.next_wake, 2000)
+        companion.companion_observe.assert_called_once()
+        packet = companion.companion_observe.call_args.args[0]
+        self.assertEqual(packet["kind"], "human_activity")
+        self.assertEqual(packet["origin"], "test:FriendMessage:person")

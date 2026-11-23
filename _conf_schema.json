@@ -44,5 +44,23 @@
   "voice_timeout_seconds": {"description": "后台想一句话最多等几秒", "type": "int", "default": 8,
     "slider": {"min": 1, "max": 60, "step": 1}, "hint": "超时使用本地接话，游戏可以继续。"},
   "send_timeout_seconds": {"description": "等待平台发出消息的最长秒数", "type": "int", "default": 30,
-    "slider": {"min": 3, "max": 120, "step": 1}}
+    "slider": {"min": 3, "max": 120, "step": 1}},
+  "interop_enabled": {
+    "description": "与其他拟人插件自然联动",
+    "type": "bool",
+    "default": true,
+    "hint": "自动发现 Codex Bridge、陪它玩、自娱自乐和短期共享情绪。共享心境、当前会话的相处与活动背景；未安装的能力自动略过，单独安装也能使用。"
+  },
+  "interop_gap_minutes": {
+    "description": "联动时两次主动开口至少隔几分钟",
+    "type": "int",
+    "default": 10,
+    "slider": {
+      "min": 0,
+      "max": 240,
+      "step": 1
+    },
+    "hint": "自娱自乐、主动邀玩和任务事件回复共用最近开口时间。只协调主动行为，手动聊天和游戏操作随时可继续。0 不额外等待。"
+  }
+
 }
