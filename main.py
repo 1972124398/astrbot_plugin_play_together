@@ -178,7 +178,7 @@ class PlayTogether(Star):
         return origin, Target()
 
     def match(self, event):
-        if self.closing or not self.config.get("enabled", True):
+        if self.closing or not self.config.get("enabled", True) or event_kind(event) != "dialogue":
             return False
         text = event.get_message_str().strip()
         if not text or text.startswith(("/", "!")) or event.get_sender_id() == event.get_self_id():

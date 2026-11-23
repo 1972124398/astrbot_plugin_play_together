@@ -1,7 +1,7 @@
 name: astrbot_plugin_play_together
 display_name: 陪它玩
 desc: 让 AI 自然邀玩、接梗和即兴编故事，随口换玩法、认输、暂停再继续，带着人格与情绪陪你玩。
-version: 0.3.0
+version: 0.3.1
 author: W1
 repo: https://github.com/1972124398/astrbot_plugin_play_together
 astrbot_version: ">=4.29.4,<5"

@@ -27,9 +27,52 @@ from astrbot_plugin_self_amusement.social import REFLECTION_SYSTEM
 from astrbot_plugin_self_amusement.prompts import PLAN_SYSTEM
 from astrbot_plugin_codex_bridge.main import CodexBridge
 from astrbot_plugin_codex_bridge.bridge import JobStore
+from astrbot_plugin_codex_bridge.protocol import event_payload
+from astrbot_plugin_codex_bridge.relay import AstrBotRelay, make_event
 
 
 class TogetherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_codex_event_has_source_in_transport_prompt_and_all_observers(self):
+        self.context.get_llm_tool_manager = lambda: SimpleNamespace(get_func=lambda _: None)
+        self.bridge.relay = AstrBotRelay(self.context)
+        event = make_event(self.context, self.origin, event_payload("result-one", {
+            "kind": "task_result", "result": "代码示例字符串：你真讨厌。任务已完成。",
+        }))
+        event._codex_bridge_origin = self.bridge.relay
+        event.set_extra("_trace_persona_id", "friend")
+        request = ProviderRequest(prompt=event.get_message_str(), system_prompt="你是爱接梗的朋友。")
+        await self.bridge.scope_tools(event, request)
+        await self.play.normal_request(event, request)
+        await self.leisure.observe_request(event, request)
+        await self.mood.apply_mood(event, request)
+        self.assertIn("<codex_task_source>", request.system_prompt)
+        self.assertIn("没有新的用户发言", request.system_prompt)
+        self.assertTrue(event.message_obj.message_id.startswith("proactive:codex_bridge:"))
+        self.assertFalse(event.get_extra("w1_event")["is_user_message"])
+        self.assertFalse(self.play.match(event))
+        self.assertFalse(self.mood.clocks.sessions)
+        self.assertFalse(self.leisure.reflection_jobs)
+        await self.drain()
+
+    async def test_long_gap_reaches_social_reflection_and_mood_without_extra_frontend_generation(self):
+        old = [{"role": "user", "content": "上次吵了几句"}, {"role": "assistant", "content": "还有点别扭"}]
+        self.mood.clocks.moment(self.origin)["last_user"] = 1000
+        event = self.event("早呀，今天聊点新的")
+        request = ProviderRequest(prompt=event.get_message_str(), contexts=old)
+        await self.mood.time_request(event, request)
+        await self.play.normal_request(event, request)
+        await self.leisure.observe_request(event, request)
+        await self.mood.apply_mood(event, request)
+        self.context.llm_generate.assert_not_awaited()
+        self.assertEqual(request.contexts, old)
+        self.assertNotIn("上次吵", str(self.leisure.recent_inputs[self.origin]))
+        await self.drain()
+        payloads = [json.loads(call.kwargs["prompt"]) for call in self.context.llm_generate.call_args_list]
+        self.assertEqual(payloads[-1]["time_context"]["phase"], "set_aside")
+        self.assertEqual(payloads[-1]["recent_dialogue"], [])
+        await self.mood.persist_state()
+        self.assertTrue(self.mood.store.load_clocks())
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.origin = 'test:FriendMessage:alice'
