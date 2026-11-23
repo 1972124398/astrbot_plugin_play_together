@@ -53,6 +53,8 @@ async def main():
     instance = metadata.star_cls
     assert instance is not None and metadata.activated
     assert metadata.config["targets"] == [] and metadata.config.schema["targets"]["_special"] == "umo"
+    tool = core.star_context.get_llm_tool_manager().get_func("play_together_turn")
+    assert tool is not None and "end_story" in tool.parameters["properties"]
     handlers = star_handlers_registry.get_handlers_by_module_name(metadata.module_path)
     handler = next(item for item in handlers if item.handler_name == "game_input")
     assert handler.extras_configs["priority"] == 1000

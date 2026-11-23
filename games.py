@@ -126,15 +126,15 @@ class StoryGame:
         return {"lines": [rng.choice(STARTERS)], "rounds": 0, "total": int(config.get("story_rounds", 4))}
 
     def opening(self, data):
-        return Turn(f"""一起编个小故事，每人一句，接 {data['total']} 轮。
+        return Turn(f"""一起编个小故事，每人一句，先大概接 {data['total']} 轮。
 我先来：{data['lines'][0]}
-你用“接：”续一句，我再接。随时可以说“不玩了”。""")
+你可以直接续一句，也可以用“接：”接上。随时可以说“不玩了”。""")
 
     def accepts(self, text):
         return bool(re.match(r"^(?:接|续)[：:]", text.strip()))
 
     def advance(self, data, text, rng):
-        line = re.sub(r"^(?:接|续)[：:]\s*", "", text.strip())[:200]
+        line = re.sub(r"^(?:接|续)[：:]\s*", "", text.strip())
         if not line:
             return Turn("用“接：”加上你想续的那句话就好。")
         data["lines"].append(line)

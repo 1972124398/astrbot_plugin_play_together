@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import math
 import random
 import time
@@ -13,10 +14,11 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
+from astrbot.core.agent.tool import ToolSet
 
 from .games import GAMES, Turn, choose_game, game_key
-from .prompts import INVITE_SYSTEM, STORY_SYSTEM, VOICE_SYSTEM, parse_invite
-from .routing import ACCEPT, AGAIN, HINT, PlayInputFilter, START, STOP, phrase
+from .prompts import INVITE_SYSTEM, MODEL_PLAY_HINT, STORY_OPEN_SYSTEM, STORY_SYSTEM, VOICE_SYSTEM, parse_invite
+from .routing import ACCEPT, AGAIN, CONCEDE, HINT, PAUSE, RESUME, SWITCH, PlayInputFilter, START, STOP, phrase
 from .runtime import Runtime
 from .state import PlayState, Room, Store, Target
 
@@ -156,14 +158,16 @@ class PlayTogether(Star):
                 return key in ACCEPT | STOP | START or game_key(text) in self.games()
             if room.player_id != event.get_sender_id():
                 return False
-            return key in STOP | HINT or (room.phase == "playing" and GAMES[room.game].accepts(text))
+            return (key in STOP | HINT | PAUSE | RESUME | SWITCH | CONCEDE | AGAIN
+                    or (room.phase in {"playing", "paused"} and GAMES[room.game].accepts(text)))
         if key in START and self.games():
             return True
         _, target = self.target_for(event)
         return bool(key in AGAIN and target.last_player == event.get_sender_id() and self.games())
 
-    def enqueue(self, scope, kind, text="", sender="", label="", message_id=""):
-        self.queues.setdefault(scope, deque()).append({"kind": kind, "text": text, "sender": sender, "label": label, "id": message_id})
+    def enqueue(self, scope, kind, text="", sender="", label="", message_id="", result=None, story_line="", end_story=False):
+        self.queues.setdefault(scope, deque()).append({"kind": kind, "text": text, "sender": sender, "label": label,
+                                                     "id": message_id, "result": result, "story_line": story_line, "end_story": end_story})
         task = self.workers.get(scope)
         if task is None or task.done():
             self.workers[scope] = asyncio.create_task(self.run_room(scope), name="play-together-turn")
@@ -178,24 +182,53 @@ class PlayTogether(Star):
         elif self.workers.get(scope) is task:
             self.workers.pop(scope, None)
 
-    def start_room(self, event, key):
+    def clear_queue(self, scope):
+        for job in self.queues.get(scope, []):
+            result = job.get("result")
+            if result is not None and not result.done():
+                result.set_result("这一步已经先放下，按当前游戏状态继续聊就好。")
+        self.queues[scope] = deque()
+
+    def start_room(self, event, key, result=None, story_line=""):
         scope = self.runtime.event_scope(event)
+        previous = self.state.rooms.get(scope)
+        if previous:
+            if previous.player_id:
+                self.state.finish(previous, "这局先放下，换个心情再玩。", time.time())
+            self.clear_queue(scope)
+            self.views.pop(scope, None)
+            task = self.workers.get(scope)
+            if task and not task.done() and scope not in self.sending:
+                task.cancel()
         room = Room(scope, event.unified_msg_origin, key, "playing", time.time(),
                     time.time() + self.setting("game_idle_minutes", 15, 2, 120) * 60,
                     player_id=event.get_sender_id(), player_name=event.get_sender_name(), data=GAMES[key].start(self.options(), random))
         self.state.rooms[scope] = room
         self.touch(room.origin)
-        self.enqueue(scope, "start")
+        self.enqueue(scope, "start", result=result, story_line=story_line)
 
     def stop_room(self, room):
         room.phase = "ending"
         room.last_public = "这局先收起来，想玩时再开一局。"
         room.revision += 1
-        self.queues[room.scope] = deque()
+        self.clear_queue(room.scope)
         task = self.workers.get(room.scope)
         if task and not task.done() and room.scope not in self.sending:
             task.cancel()
         self.enqueue(room.scope, "stop")
+
+    def pause_room(self, room):
+        if room.phase != "paused":
+            room.paused_public = room.last_public
+        room.phase = "paused"
+        room.revision += 1
+        room.expires = time.time() + self.setting("pause_minutes", 60, 5, 1440) * 60
+        self.clear_queue(room.scope)
+        task = self.workers.get(room.scope)
+        if task and not task.done() and room.scope not in self.sending:
+            task.cancel()
+        self.enqueue(room.scope, "pause", sender=room.player_id)
+        self.changed()
 
     @filter.custom_filter(PlayInputFilter, priority=1000)
     async def game_input(self, event: AstrMessageEvent):
@@ -222,7 +255,17 @@ class PlayTogether(Star):
             self.enqueue(room.scope, "start")
         else:
             self.touch(room.origin)
-            self.enqueue(room.scope, "hint" if key in HINT else "turn", text, event.get_sender_id(), event.get_sender_name(), event.message_obj.message_id)
+            if key in PAUSE:
+                self.pause_room(room)
+            elif key in SWITCH | AGAIN:
+                chosen = room.game if key in AGAIN else choose_game([game for game in self.games() if game != room.game])
+                if chosen:
+                    self.start_room(event, chosen)
+                else:
+                    self.enqueue(room.scope, "hint", sender=event.get_sender_id())
+            else:
+                kind = "hint" if key in HINT else "concede" if key in CONCEDE else "resume" if key in RESUME else "turn"
+                self.enqueue(room.scope, kind, text, event.get_sender_id(), event.get_sender_name(), event.message_obj.message_id)
         event.stop_event()
         event.set_extra("play_together_handled", True)
         self.changed()
@@ -239,7 +282,7 @@ class PlayTogether(Star):
                 task = asyncio.create_task(self.runtime.generate(view, system, data), name="play-together-voice")
                 self.voices[room.scope] = task
                 try:
-                    return (await task).splitlines()[0][:160]
+                    return (await task).strip() or fallback
                 finally:
                     self.voices.pop(room.scope, None)
         except asyncio.CancelledError:
@@ -258,31 +301,58 @@ class PlayTogether(Star):
         if job["id"] and job["id"] in room.seen:
             return
         if job["kind"] == "start":
+            if room.game == "story":
+                opening = job.get("story_line") or await self.voice(room, STORY_OPEN_SYSTEM, {"previous_start": room.data["lines"][0]}, room.data["lines"][0])
+                room.data["lines"][0] = opening
             turn = GAMES[room.game].opening(room.data)
         elif job["kind"] == "stop":
             turn = Turn("好，先收起来。之后想玩再叫我。", "stopped", True, "stopped")
+        elif job["kind"] == "pause":
+            room.phase = "paused"
+            turn = Turn("先把这局放在这里，回来可以说“继续玩”，也可以直接接着出招。", "relaxed")
         else:
-            if room.phase != "playing" or job["sender"] != room.player_id:
+            if room.phase not in {"playing", "paused"} or job["sender"] != room.player_id:
                 return
-            turn = GAMES[room.game].hint(room.data) if job["kind"] == "hint" else GAMES[room.game].advance(room.data, job["text"], random)
+            if job["kind"] == "resume":
+                room.phase = "playing"
+                turn = Turn("回来啦，接着刚才这儿玩。\n" + (room.paused_public or GAMES[room.game].opening(room.data).facts))
+            elif job["kind"] == "concede":
+                if room.game == "number":
+                    turn = Turn(f"好，那我揭晓：藏的是 {room.data['answer']}。这局就先让我得意一下。", "smug", True, "bot_won")
+                elif room.game == "rps":
+                    turn = Turn(f"这局你先认输啦，当前比分是你 {room.data['user_wins']} : 我 {room.data['bot_wins']}。", "smug", True, "bot_won")
+                else:
+                    turn = Turn("", "curious", True, "story_finished", True)
+            elif job["kind"] == "hint":
+                turn = GAMES[room.game].hint(room.data)
+            else:
+                room.phase = "playing"
+                text = job["text"]
+                if room.game == "story" and not GAMES["story"].accepts(text):
+                    text = "接：" + text
+                turn = GAMES[room.game].advance(room.data, text, random)
         if turn.story:
+            if job.get("result") is not None and job["kind"] == "turn":
+                turn.finished = bool(job.get("end_story"))
+                turn.outcome = "story_finished" if turn.finished else ""
             fallback = "于是，他们决定把这个秘密留到明天再慢慢研究。" if turn.finished else "话音刚落，门外又传来三声敲门声，还有一句小小的“我也想参加”。"
-            line = await self.voice(room, STORY_SYSTEM, {"lines": room.data["lines"], "closing": turn.finished}, fallback)
+            line = job.get("story_line") or await self.voice(room, STORY_SYSTEM, {"lines": room.data["lines"], "closing": turn.finished}, fallback)
             room.data["lines"].append(line)
             turn.facts = "我接：" + line + ("\n这段小故事先收在这里。想再编可说“再来一局”。" if turn.finished else "\n轮到你，用“接：”再续一句。")
-        prefix = ""
-        if job["kind"] == "start" or (turn.finished and turn.outcome != "stopped" and not turn.story):
-            prefix = await self.voice(room, VOICE_SYSTEM, {"game": GAMES[room.game].name, "moment": "opening" if job["kind"] == "start" else turn.feeling})
-        elif job["kind"] == "turn" and room.game == "rps":
-            prefix = random.choice({"smug": ["嘿，这回让我得意一下。", "这轮接住了！"], "sulky": ["啧，被你拿下了。", "这轮算你厉害。"], "playful": ["还真想到一块去了。", "居然一样，再来。"]}[turn.feeling])
-        elif turn.feeling == "nervous":
-            prefix = random.choice(["被你逼近了。", "这下有点藏不住了。"])
-        text = (prefix + "\n" if prefix else "") + turn.facts
+        text = turn.facts
+        if job.get("result") is None and not turn.story and job["kind"] != "stop":
+            text = await self.voice(room, VOICE_SYSTEM, {
+                "game": GAMES[room.game].name, "moment": "opening" if job["kind"] == "start" else turn.feeling,
+                "facts": turn.facts, "player_message": job["text"], "previous_reply": source.last_public,
+            }, turn.facts)
+        if job["kind"] == "start" and room.game == "story":
+            room.data["lines"][0] = text
         if self.state.rooms.get(scope) is not source or source.revision != room.revision:
             return
         room.revision += 1
         room.updated = time.time()
-        room.expires = room.updated + self.setting("game_idle_minutes", 15, 2, 120) * 60
+        minutes = self.setting("pause_minutes", 60, 5, 1440) if room.phase == "paused" else self.setting("game_idle_minutes", 15, 2, 120)
+        room.expires = room.updated + minutes * 60
         room.last_public = text
         if job["id"]:
             room.seen = [*room.seen, job["id"]][-40:]
@@ -294,8 +364,9 @@ class PlayTogether(Star):
             return
         self.sending.add(scope)
         try:
-            async with asyncio.timeout(self.setting("send_timeout_seconds", 30, 3, 120)):
-                await self.runtime.send(room.origin, text)
+            if job.get("result") is None:
+                async with asyncio.timeout(self.setting("send_timeout_seconds", 30, 3, 120)):
+                    await self.runtime.send(room.origin, text)
         finally:
             self.sending.discard(scope)
             if turn.finished and self.state.rooms.get(scope) is room:
@@ -304,17 +375,25 @@ class PlayTogether(Star):
                 self.views.pop(scope, None)
                 self.touch(room.origin, human=bool(room.player_id))
                 await self.persist()
+        return text
 
     async def run_room(self, scope):
         while self.queues.get(scope):
             job = self.queues[scope].popleft()
+            result = job.get("result")
             try:
-                await self.process(scope, job)
+                text = await self.process(scope, job)
+                if result is not None and not result.done():
+                    result.set_result(text or "这局状态已经有了变化，按当前状态继续接话。")
             except asyncio.CancelledError:
+                if result is not None and not result.done():
+                    result.set_result("这一步先放下了，可以按当前游戏状态继续聊。")
                 if self.closing:
                     raise
             except Exception as error:
                 logger.warning("Play Together could not finish this game turn (%s)", type(error).__name__)
+                if result is not None and not result.done():
+                    result.set_result("这一步没接好，可以看看 /play_status，再继续玩。")
         self.queues.pop(scope, None)
 
     async def auto_invite(self):
@@ -417,10 +496,99 @@ class PlayTogether(Star):
             except TimeoutError:
                 pass
 
+    def public_game(self, room):
+        data = {"game": GAMES[room.game].name, "phase": room.phase,
+                "player": room.player_name, "last_reply": room.last_public}
+        if room.phase == "invite":
+            return data
+        if room.game == "number":
+            data.update(range=[room.data["low"], room.data["high"]], chances_left=room.data["left"])
+        elif room.game == "rps":
+            data.update(user_wins=room.data["user_wins"], your_wins=room.data["bot_wins"], best_of=room.data["best_of"])
+        else:
+            data.update(story=room.data["lines"][-10:], rounds=room.data["rounds"], total_rounds=room.data["total"])
+        return data
+
+    def model_tools(self, event, request):
+        get_manager = getattr(self.context, "get_llm_tool_manager", None)
+        if not get_manager:
+            return
+        if request.func_tool is not None:
+            request.func_tool.remove_tool("play_together_turn")
+        if not self.config.get("natural_play", True) or not self.config.get("enabled", True):
+            return
+        room = self.room_for(event)
+        owns = room and (not room.player_id or room.player_id == event.get_sender_id())
+        related = owns or (not room and any(word in event.get_message_str() for word in ("玩", "猜数字", "猜拳", "接龙")))
+        if not related:
+            return
+        tool = get_manager().get_func("play_together_turn")
+        if tool is None or not getattr(tool, "active", True):
+            return
+        if request.func_tool is None:
+            request.func_tool = ToolSet()
+        request.func_tool.add_tool(tool)
+        state = self.public_game(room) if room else {"games": {key: GAMES[key].name for key in self.games()}, "phase": "not_started"}
+        state["play_preferences"] = str(self.config.get("play_preferences", "") or "")
+        request.extra_user_content_parts.append(TextPart(text=MODEL_PLAY_HINT + "\n" + json.dumps(state, ensure_ascii=False)).mark_as_temp())
+
+    @filter.llm_tool(name="play_together_turn")
+    async def model_turn(self, event: AstrMessageEvent, action: str, value: str = "", story_line: str = "", end_story: bool = False) -> str:
+        """陪当前玩家自然玩游戏，更新实际进度并返回公开结果，供你自己组织回复。
+
+        Args:
+            action(string): start 开局，move 猜数字/出拳/接故事，hint 提示，switch 换游戏，concede 认输，pause 暂停，resume 继续，stop 收起。
+            value(string): 玩家操作，猜数字用阿拉伯数字，出拳用石头/剪刀/布，故事用玩家这一句。开局或换游戏可填游戏名称。
+            story_line(string): 玩故事时你接着编的那一小段，可以结合当前人格自由发挥，收尾时让情节自然落下。
+            end_story(bool): 这次自然故事接龙是否收尾。轮数只是参考，双方兴致未尽可以继续，收尾时设为 true。
+        """
+        if self.closing or not self.config.get("enabled", True):
+            return "陪它玩现在歇着，可以正常聊天。"
+        room = self.room_for(event)
+        if room and room.player_id and room.player_id != event.get_sender_id():
+            return "当前这局由另一位玩家在玩，先让他们收尾。"
+        future = asyncio.get_running_loop().create_future()
+        if action in {"start", "switch"}:
+            if room and room.phase in {"playing", "paused"} and action == "start":
+                return "当前已经开局，可以 move 接着玩、resume 继续，或者 switch 换一种。"
+            key = game_key(value) if value else (room.game if room and room.phase == "invite" else choose_game([key for key in self.games() if not room or key != room.game]))
+            if key not in self.games():
+                return "现在可以玩：" + "、".join(GAMES[key].name for key in self.games())
+            self.start_room(event, key, result=future, story_line=story_line.strip())
+            scope = self.runtime.event_scope(event)
+            played_room = self.state.rooms[scope]
+        else:
+            if not room or (room.phase == "invite" and action != "stop"):
+                return "还没有接住这一局，可以先用 start 开始。"
+            kinds = {"move": "turn", "hint": "hint", "concede": "concede", "pause": "pause", "resume": "resume", "stop": "stop"}
+            if action not in kinds:
+                return "可以按当前游戏自然选择出招、提示、换游戏、暂停、继续或收起。"
+            if action == "pause":
+                room.paused_public = room.paused_public or room.last_public
+            if action == "stop" and room.phase == "invite":
+                self.state.targets.setdefault(room.origin, Target()).ignored = True
+            self.touch(room.origin)
+            scope = room.scope
+            played_room = room
+            self.enqueue(scope, kinds[action], value or event.get_message_str(), event.get_sender_id(), event.get_sender_name(),
+                         result=future, story_line=story_line.strip(), end_story=end_story)
+        try:
+            result = await asyncio.wait_for(asyncio.shield(future), timeout=40)
+            current = self.state.rooms.get(scope)
+            event.set_extra("play_together_model_reply", {
+                "scope": scope, "uid": played_room.uid, "origin": played_room.origin,
+                "revision": current.revision if current and current.uid == played_room.uid else None,
+                "story_line": played_room.game == "story" and action in {"move", "start", "switch"},
+            })
+            return "游戏进度已更新，公开结果如下。请用自己的口吻直接接话，插件不会另发重复回复。\n" + result
+        except TimeoutError:
+            return "这一步还在后台接，先看看 /play_status，再决定怎么继续。"
+
     @filter.on_llm_request(priority=-120)
     async def normal_request(self, event: AstrMessageEvent, request):
         if event.get_extra("play_together") or self.closing or not self.config.get("enabled", True):
             return
+        self.model_tools(event, request)
         token = event.get_extra("play_together_turn")
         if token is None:
             self.serial += 1
@@ -432,12 +600,6 @@ class PlayTogether(Star):
         for task in self.voices.values():
             task.cancel()
         origin = self.target_for(event)[0]
-        room = self.room_for(event)
-        if room and room.phase == "invite":
-            if any(word in event.get_message_str() for word in ("怎么玩", "什么游戏", "啥游戏", "哪个游戏", "玩法", "规则", "猜数字", "猜拳", "故事", "接龙")):
-                request.extra_user_content_parts.append(TextPart(text=f"你刚刚邀请当前会话玩{GAMES[room.game].name}，还在等对方接住。可以自然解释玩法，确认时让对方说“来一局”或用 /play 指定游戏，实际开局由陪它玩插件处理。").mark_as_temp())
-            else:
-                self.state.rooms.pop(room.scope, None)
         self.state.touch(time.time(), self.delay(), origin if origin in self.state.targets or origin in self.targets() else "")
         target = self.state.targets.get(origin)
         if target and target.last_result:
@@ -446,6 +608,21 @@ class PlayTogether(Star):
 
     @filter.on_llm_response(priority=-120)
     async def normal_response(self, event: AstrMessageEvent, response):
+        reply = event.get_extra("play_together_model_reply")
+        text = getattr(response, "completion_text", "") or ""
+        if reply and text:
+            room = self.state.rooms.get(reply["scope"])
+            if room and room.uid == reply["uid"] and room.revision == reply["revision"]:
+                room.last_public = text
+                if reply["story_line"] and room.data.get("lines"):
+                    room.data["lines"][-1] = text.removeprefix("接：").removeprefix("我接：").strip()
+                self.changed()
+            target = self.state.targets.get(reply["origin"])
+            if target and target.last_room_id == reply["uid"]:
+                target.last_result = text
+                if target.recent:
+                    target.recent[-1]["result"] = text[:500]
+                self.changed()
         self.normal_turns.pop(event.get_extra("play_together_turn"), None)
         self.wake.set()
 
@@ -465,7 +642,13 @@ class PlayTogether(Star):
             self.state.rooms.pop(room.scope, None)
             room = None
         if room and room.expires > time.time():
-            yield event.plain_result("这边还有一局。用 /play_status 看看，或用 /play_stop 先收起来。")
+            selected = game_key(game) if game else None
+            if selected in self.games() and (room.player_id == event.get_sender_id() or not room.player_id):
+                self.start_room(event, selected)
+                yield event.plain_result("好，换个心情开这局。")
+                event.stop_event()
+                return
+            yield event.plain_result("我们这局还在。可以说“换个游戏”“先等一下”，或者接着出招。")
             return
         key = game_key(game) if game else (invited if invited in self.games() else choose_game(self.games(), self.target_for(event)[1].last_game))
         if key not in self.games():
@@ -504,6 +687,25 @@ class PlayTogether(Star):
         else:
             target = self.target_for(event)[1]
             yield event.plain_result(target.last_result or "还没开局呢。说“陪我玩”或 /play 就能来一小局。")
+
+    @filter.command("play_pause", priority=1000)
+    async def pause(self, event: AstrMessageEvent):
+        room = self.room_for(event)
+        if room and room.player_id == event.get_sender_id() and room.phase in {"playing", "paused"}:
+            self.pause_room(room)
+            event.stop_event()
+        else:
+            yield event.plain_result("这会儿没有你正在玩的局。想玩就叫我。")
+
+    @filter.command("play_resume", priority=1000)
+    async def resume(self, event: AstrMessageEvent):
+        room = self.room_for(event)
+        if room and room.player_id == event.get_sender_id() and room.phase == "paused":
+            self.touch(room.origin)
+            self.enqueue(room.scope, "resume", sender=event.get_sender_id())
+            event.stop_event()
+        else:
+            yield event.plain_result("我们可以直接开一小局，或者接着正在玩的出招。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("play_here", priority=1000)

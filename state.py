@@ -24,6 +24,7 @@ class Room:
     revision: int = 0
     last_public: str = ""
     seen: list[str] = field(default_factory=list)
+    paused_public: str = ""
 
 
 @dataclass
@@ -34,6 +35,7 @@ class Target:
     last_player: str = ""
     last_result: str = ""
     recent: list[dict] = field(default_factory=list)
+    last_room_id: str = ""
 
 
 @dataclass
@@ -82,6 +84,7 @@ class PlayState:
         target.last_game = room.game
         target.last_player = room.player_id
         target.last_result = result
+        target.last_room_id = room.uid
         target.recent.append({"game": room.game, "result": result[:500], "time": now})
         target.recent = target.recent[-4:]
 

@@ -223,3 +223,93 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schema["targets"]["_special"], "umo")
         self.assertEqual(config["targets"], [])
         self.assertEqual(config["games"], ["number", "rps", "story"])
+
+    async def test_pause_and_resume_keep_the_same_hidden_number_and_progress(self):
+        room = await self.start()
+        room.data["answer"] = 17
+        await self.plugin.game_input(self.event("12"))
+        await self.drain()
+        await self.plugin.game_input(self.event("先等一下"))
+        await self.drain()
+        paused = self.plugin.state.rooms[self.origin]
+        self.assertEqual(paused.phase, "paused")
+        self.assertEqual(paused.data["left"], 5)
+        await self.plugin.game_input(self.event("我回来了"))
+        await self.drain()
+        self.assertEqual(self.plugin.state.rooms[self.origin].phase, "playing")
+        self.assertEqual(self.plugin.state.rooms[self.origin].data["answer"], 17)
+
+    async def test_conceding_reveals_the_answer_and_switching_can_start_a_story(self):
+        room = await self.start()
+        room.data["answer"] = 17
+        await self.plugin.game_input(self.event("我认输啦"))
+        await self.drain()
+        self.assertIn("17", self.messages[-1][1])
+        self.assertFalse(self.plugin.state.rooms)
+        await self.start()
+        [result async for result in self.plugin.play(self.event("换故事"), "story")]
+        await self.drain()
+        self.assertEqual(self.plugin.state.rooms[self.origin].game, "story")
+
+    async def test_model_action_returns_facts_without_sending_a_duplicate_message(self):
+        room = await self.start()
+        room.data["answer"] = 17
+        before = len(self.messages)
+        result = await self.plugin.model_turn(self.event("要不就猜十七"), "move", "17")
+        self.assertIn("被你猜中了", result)
+        self.assertEqual(len(self.messages), before)
+        self.assertFalse(self.plugin.state.rooms)
+
+    async def test_model_can_supply_both_sides_of_a_natural_story_turn(self):
+        await self.start("story")
+        before = len(self.messages)
+        calls = self.plugin.runtime.generate.await_count
+        result = await self.plugin.model_turn(self.event("猫决定报名当侦探"), "move", "猫决定报名当侦探", "鸭子们连夜把雨伞藏进了月亮里。")
+        self.assertIn("月亮", result)
+        self.assertIn("猫决定报名当侦探", self.plugin.state.rooms[self.origin].data["lines"])
+        self.assertEqual(self.plugin.runtime.generate.await_count, calls)
+        self.assertEqual(len(self.messages), before)
+
+    async def test_model_tool_only_appears_for_the_current_group_player(self):
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+
+        tool = FunctionTool(name="play_together_turn", description="陪玩", parameters={"type": "object", "properties": {}})
+        self.context.get_llm_tool_manager = lambda: SimpleNamespace(get_func=lambda _: tool)
+        await self.start(group="group")
+        request = ProviderRequest(prompt="这把我想出剪刀")
+        self.plugin.model_tools(self.event("这把我想出剪刀", group="group"), request)
+        self.assertEqual(request.func_tool.tools[0].name, "play_together_turn")
+        hint = request.extra_user_content_parts[0].text
+        self.assertNotIn("bot_move", hint)
+        other = ProviderRequest(prompt="普通群聊", func_tool=ToolSet([tool]))
+        self.plugin.model_tools(self.event("普通群聊", user="other", group="group"), other)
+        self.assertFalse(other.func_tool.tools)
+
+    async def test_whole_reply_and_story_opening_are_generated_freely(self):
+        self.plugin.config["model_voice"] = True
+        self.plugin.runtime.generate.return_value = "这回我要藏得巧一点。你先猜一个吧！"
+        await self.start()
+        self.assertEqual(self.messages[-1][1], "这回我要藏得巧一点。你先猜一个吧！")
+        self.plugin.runtime.generate.return_value = "一只猫忽然把月亮装进了自己的口袋。"
+        [result async for result in self.plugin.play(self.event("换故事"), "story")]
+        await self.drain()
+        self.assertEqual(self.plugin.state.rooms[self.origin].data["lines"][0], "一只猫忽然把月亮装进了自己的口袋。")
+
+    async def test_natural_story_can_continue_past_suggested_rounds_and_end_when_ready(self):
+        room = await self.start("story")
+        room.data["total"] = 1
+        event = self.event("猫把月亮放进罐子")
+        await self.plugin.model_turn(event, "move", "猫把月亮放进罐子", "鸭子好奇地敲了敲罐子。")
+        self.assertIn(self.origin, self.plugin.state.rooms)
+        await self.plugin.model_turn(self.event("最后罐子又打开了"), "move", "最后罐子又打开了", "月亮跳回天上，留了一罐星星给大家。", True)
+        self.assertNotIn(self.origin, self.plugin.state.rooms)
+
+    async def test_story_remembers_the_reply_the_model_actually_showed_to_the_player(self):
+        await self.start("story")
+        event = self.event("猫要去月亮上进货")
+        await self.plugin.model_turn(event, "move", "猫要去月亮上进货", "先拿两罐星星试试。")
+        actual = "接：我递给它一个背包，说月亮上打折时记得多带两罐星星。"
+        await self.plugin.normal_response(event, SimpleNamespace(completion_text=actual))
+        room = self.plugin.state.rooms[self.origin]
+        self.assertIn("背包", room.data["lines"][-1])
+        self.assertEqual(room.last_public, actual)
