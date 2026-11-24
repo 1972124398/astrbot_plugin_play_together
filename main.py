@@ -462,6 +462,8 @@ class PlayTogether(Star):
         for origin in self.targets():
             if preferred_origin and origin != preferred_origin:
                 continue
+            if not self.link.routine_allows_initiative(origin):
+                continue
             target = self.state.targets.get(origin, Target())
             if target.ignored or now - target.last_invited < self.setting("target_gap_minutes", 240, 10, 10080) * 60:
                 continue
