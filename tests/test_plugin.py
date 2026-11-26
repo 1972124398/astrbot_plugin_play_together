@@ -103,6 +103,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(PlayInputFilter().filter(self.event(text), {}))
         self.assertTrue(PlayInputFilter().filter(self.event("我猜15"), {}))
 
+    async def test_companion_cleanup_discards_room_and_history_only_after_send(self):
+        room = await self.start()
+        other = "test:FriendMessage:other"
+        self.plugin.state.targets[self.origin] = Target(last_result="old game")
+        self.plugin.state.targets[other] = Target(last_result="other game")
+        self.plugin.sending.add(room.scope)
+        self.assertEqual(await self.plugin.companion_clear(self.origin, persona="test"), "busy")
+        self.assertIn(room.scope, self.plugin.state.rooms)
+        self.plugin.sending.clear()
+        self.assertEqual(await self.plugin.companion_clear(self.origin, persona="test"), "cleared")
+        saved = self.plugin.store.load()
+        self.assertNotIn(room.scope, saved.rooms)
+        self.assertNotIn(self.origin, saved.targets)
+        self.assertEqual(saved.targets[other].last_result, "other game")
+
     async def test_group_game_only_accepts_current_player_and_keeps_group_scope(self):
         room = await self.start(group="group")
         self.assertTrue(self.plugin.match(self.event("12", group="group")))

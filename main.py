@@ -42,6 +42,7 @@ class PlayTogether(Star):
         self.views = {}
         self.sending = set()
         self.normal_turns = {}
+        self.cleared_at = {}
         self.serial = 0
         self.auto_task = None
         self.auto_sending = False
@@ -136,6 +137,29 @@ class PlayTogether(Star):
             self.state.touch(time.time(), self.delay(), origin if origin in self.targets() else "")
             self.changed()
             self.wake.set()
+
+    async def companion_clear(self, origin, *, persona):
+        scope = conversation_key(origin)
+        rooms = [room for room in self.state.rooms.values() if conversation_key(room.origin) == scope]
+        room_keys = {origin, scope, *(room.scope for room in rooms)}
+        if self.sending.intersection(room_keys) or (rooms and self.auto_sending):
+            return "busy"
+        self.cleared_at[scope] = time.monotonic()
+        self.state.revision += 1
+        for room_key in room_keys:
+            self.state.rooms.pop(room_key, None)
+            self.views.pop(room_key, None)
+            self.clear_queue(room_key)
+            self.queues.pop(room_key, None)
+            worker = self.workers.get(room_key)
+            if worker and not worker.done():
+                worker.cancel()
+        for umo in list(self.state.targets):
+            if conversation_key(umo) == scope:
+                self.state.targets.pop(umo)
+        self.changed()
+        await self.persist()
+        return "cleared"
 
     async def invite_from_companion(self, origin, idea, idle_token):
         if not self.link.enabled or not self.link.idle_current(idle_token):
@@ -632,6 +656,7 @@ class PlayTogether(Star):
             self.enqueue(scope, kinds[action], value or event.get_message_str(), event.get_sender_id(), event.get_sender_name(),
                          result=future, story_line=story_line.strip(), end_story=end_story)
         try:
+            started = time.monotonic()
             result = await asyncio.wait_for(asyncio.shield(future), timeout=40)
             current = self.state.rooms.get(scope)
             event.set_extra("play_together_model_reply", {
@@ -639,6 +664,7 @@ class PlayTogether(Star):
                 "revision": current.revision if current and current.uid == played_room.uid else None,
                 "story_line": played_room.game == "story" and action in {"move", "start", "switch"},
                 "game": GAMES[played_room.game].name, "action": action, "facts": result,
+                "started": started,
             })
             return "游戏进度已更新，公开结果如下。请用自己的口吻直接接话，插件不会另发重复回复。\n" + result
         except TimeoutError:
@@ -681,7 +707,7 @@ class PlayTogether(Star):
             return
         reply = event.get_extra("play_together_model_reply")
         text = getattr(response, "completion_text", "") or ""
-        if reply and text:
+        if reply and text and reply.get("started", 0) >= self.cleared_at.get(conversation_key(reply["origin"]), 0):
             self.link.publish("game_turn", reply["origin"], {
                 "game": reply["game"], "action": reply["action"], "outcome": reply["facts"],
                 "human_text": "", "reply": text, "handled_by_chat": True,
